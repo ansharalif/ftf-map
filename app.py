@@ -1,228 +1,166 @@
-from io import StringIO
-import sys
+import os
+from pathlib import Path
 import pandas as pd
-
-# =========================================================
-# Peta Interaktif FTF Knowledge Hub (Template + Sample Data)
-# Robust version with graceful fallback when plotly is unavailable
-# =========================================================
-# Solusi error umum di Streamlit Cloud:
-# - Tambahkan `plotly` ke requirements.txt
-# - Jika plotly belum tersedia, app tetap jalan dengan fallback tabel + ringkasan
-# =========================================================
+import streamlit as st
+import folium
+from folium import IFrame
 
 try:
-    import plotly.express as px  # type: ignore
-    PLOTLY_AVAILABLE = True
-except ModuleNotFoundError:
-    px = None
-    PLOTLY_AVAILABLE = False
+    from streamlit_folium import st_folium
+    HAS_ST_FOLIUM = True
+except Exception:
+    HAS_ST_FOLIUM = False
 
-try:
-    import streamlit as st  # optional if running as Streamlit app
-    STREAMLIT_AVAILABLE = True
-except ModuleNotFoundError:
-    st = None
-    STREAMLIT_AVAILABLE = False
+st.set_page_config(page_title="FTF Country Status Map", page_icon="🗺️", layout="wide")
 
-DATA_CSV = """country,iso3,region,last_updated,ftf_departed_min,ftf_departed_max,ftf_returned_min,ftf_returned_max,update_status,data_completeness,source_note
-Tunisia,TUN,Africa,2025-12-01,3000,7000,970,1500,Updated,Q1 2026 snippet,Tunisia PDF snippet (search result)
-Turkey,TUR,Europe/Asia,2025-08-01,5000,6581,600,600,Needs Update,Q1 2026 snippet,Turkiye PDF snippet (search result)
-Australia,AUS,Oceania,2025-12-01,230,230,44,44,Updated,Q1 2026 snippet,Australia PDF snippet (search result)
-Algeria,DZA,Africa,2025-12-01,500,785,87,150,Updated,Q1 2026 snippet,Algeria PDF snippet (search result)
-Indonesia,IDN,Asia,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-Germany,DEU,Europe,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-France,FRA,Europe,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-Netherlands,NLD,Europe,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-Sweden,SWE,Europe,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-Denmark,DNK,Europe,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-Saudi Arabia,SAU,Middle East,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-United Arab Emirates,ARE,Middle East,2024-02-01,,,,,Needs Review,Country page available,Country page found via FTF Hub search result
-"""
+STATUS_COLORS = {"belum": "#d73027", "draft": "#fdae61", "final": "#1a9850"}
+REGION_ORDER = ["Asia", "MENA", "Eropa", "Amerika Utara", "Afrika", "Oseania", "Lainnya"]
+DEFAULT_DATA = Path(__file__).parent / "data" / "ftf_country_status_sample.csv"
 
-
-def load_data() -> pd.DataFrame:
-    df = pd.read_csv(StringIO(DATA_CSV))
-    df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce")
-    num_cols = ["ftf_departed_min", "ftf_departed_max", "ftf_returned_min", "ftf_returned_max"]
-    for c in num_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    def midpoint(a, b):
-        if pd.notna(a) and pd.notna(b):
-            return (a + b) / 2
-        if pd.notna(a):
-            return a
-        if pd.notna(b):
-            return b
-        return pd.NA
-
-    df["departed_mid"] = [midpoint(a, b) for a, b in zip(df["ftf_departed_min"], df["ftf_departed_max"])]
-    df["returned_mid"] = [midpoint(a, b) for a, b in zip(df["ftf_returned_min"], df["ftf_returned_max"])]
-    df["has_quant"] = df["departed_mid"].notna()
-    today = pd.Timestamp.today().normalize()
-    df["days_since_update"] = (today - df["last_updated"]).dt.days
+@st.cache_data
+def load_data(file_obj=None):
+    df = pd.read_csv(file_obj) if file_obj is not None else pd.read_csv(DEFAULT_DATA)
+    required_cols = ["country", "iso2", "region", "status_review", "last_reviewed", "tema_dominan", "catatan_singkat", "lat", "lon", "ftf_hub_url", "brief_internal_url"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Kolom wajib belum ada: {missing}")
+    df["status_review"] = df["status_review"].astype(str).str.strip().str.lower()
+    df["region"] = df["region"].astype(str).str.strip()
+    df["last_reviewed"] = pd.to_datetime(df["last_reviewed"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["tema_dominan"] = df["tema_dominan"].fillna("-")
+    df["catatan_singkat"] = df["catatan_singkat"].fillna("-")
+    df["brief_internal_url"] = df["brief_internal_url"].fillna("")
     return df
 
+def status_badge_html(status: str) -> str:
+    color = STATUS_COLORS.get(status, "#6c757d")
+    return f'<span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{color};color:white;font-weight:600;font-size:12px;">{status.upper()}</span>'
 
-def build_choropleth(df: pd.DataFrame):
-    if not PLOTLY_AVAILABLE:
-        raise RuntimeError("plotly tidak tersedia")
+def make_popup_html(row):
+    brief_link = str(row.get("brief_internal_url", "")).strip()
+    brief_html = f'<a href="{brief_link}" target="_blank">Buka brief internal</a>' if brief_link else '<span style="color:#666;">Brief internal belum ditautkan</span>'
+    return f"""
+    <div style=\"font-family:Arial,sans-serif; font-size:13px; line-height:1.45; width: 290px;\">
+      <h4 style=\"margin:0 0 8px 0;\">{row['country']}</h4>
+      <div style=\"margin-bottom:6px;\">{status_badge_html(row['status_review'])}</div>
+      <table style=\"width:100%; border-collapse:collapse;\">
+        <tr><td style=\"vertical-align:top; width:110px;\"><b>Region</b></td><td>{row['region']}</td></tr>
+        <tr><td style=\"vertical-align:top;\"><b>Last reviewed</b></td><td>{row['last_reviewed'] or '-'}</td></tr>
+        <tr><td style=\"vertical-align:top;\"><b>Tema dominan</b></td><td>{row['tema_dominan']}</td></tr>
+        <tr><td style=\"vertical-align:top;\"><b>Catatan</b></td><td>{row['catatan_singkat']}</td></tr>
+      </table>
+      <hr style=\"margin:8px 0;\">
+      <div style=\"display:flex; gap:12px; flex-wrap:wrap;\">
+        <a href=\"{row['ftf_hub_url']}\" target=\"_blank\">Buka FTF Hub</a>
+        {brief_html}
+      </div>
+    </div>
+    """
 
-    hover_cols = {
-        "country": True,
-        "region": True,
-        "last_updated": True,
-        "ftf_departed_min": True,
-        "ftf_departed_max": True,
-        "ftf_returned_min": True,
-        "ftf_returned_max": True,
-        "update_status": True,
-        "data_completeness": True,
-        "source_note": True,
-        "departed_mid": ':.0f',
-        "returned_mid": ':.0f',
-    }
-
-    fig = px.choropleth(
-        df,
-        locations="iso3",
-        color="departed_mid",
-        hover_name="country",
-        hover_data=hover_cols,
-        color_continuous_scale="YlOrRd",
-        title="Peta Interaktif FTF (Sample/Template) — Estimasi FTF Departed (midpoint range)",
-    )
-    fig.update_geos(showcoastlines=True, coastlinecolor="gray", showframe=False, projection_type="natural earth")
-    fig.update_layout(margin=dict(l=20, r=20, t=60, b=20), coloraxis_colorbar_title="Departed (mid)")
-    return fig
-
-
-def build_status_scatter(df: pd.DataFrame):
-    if not PLOTLY_AVAILABLE:
-        raise RuntimeError("plotly tidak tersedia")
-
-    fig = px.scatter_geo(
-        df,
-        locations="country",
-        locationmode="country names",
-        color="update_status",
-        symbol="has_quant",
-        hover_name="country",
-        hover_data={
-            "region": True,
-            "last_updated": True,
-            "data_completeness": True,
-            "days_since_update": True,
-            "source_note": True,
-            "has_quant": True,
-        },
-        title="Overlay Status Pembaruan & Ketersediaan Data Kuantitatif",
-    )
-    fig.update_geos(showcoastlines=True, coastlinecolor="gray", showframe=False)
-    fig.update_layout(margin=dict(l=20, r=20, t=60, b=20))
-    return fig
-
-
-def render_streamlit():
-    st.set_page_config(page_title="FTF Interactive Map", layout="wide")
-    st.title("Peta Interaktif FTF Knowledge Hub")
-    st.caption("Template/sample untuk visualisasi data FTF per negara (semi-manual, dapat diisi bertahap).")
-
-    df = load_data()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total negara", len(df))
-    c2.metric("Negara dengan data kuantitatif", int(df["has_quant"].sum()))
-    c3.metric("Perlu update/review", int(df["update_status"].isin(["Needs Update", "Needs Review"]).sum()))
-
-    st.markdown("### Filter")
-    region_opts = ["Semua"] + sorted(df["region"].dropna().unique().tolist())
-    status_opts = ["Semua"] + sorted(df["update_status"].dropna().unique().tolist())
-    colf1, colf2 = st.columns(2)
-    with colf1:
-        region_filter = st.selectbox("Region", region_opts)
-    with colf2:
-        status_filter = st.selectbox("Status Update", status_opts)
-
-    filtered = df.copy()
-    if region_filter != "Semua":
-        filtered = filtered[filtered["region"] == region_filter]
-    if status_filter != "Semua":
-        filtered = filtered[filtered["update_status"] == status_filter]
-
-    if PLOTLY_AVAILABLE:
-        st.markdown("### Choropleth Map")
-        st.plotly_chart(build_choropleth(filtered), use_container_width=True)
-
-        st.markdown("### Status Overlay Map")
-        st.plotly_chart(build_status_scatter(filtered), use_container_width=True)
-    else:
-        st.warning(
-            "Module `plotly` belum tersedia di environment ini. "
-            "Map interaktif tidak bisa ditampilkan, tapi tabel monitoring tetap tersedia. "
-            "Tambahkan `plotly` ke requirements.txt."
-        )
-
-    st.markdown("### Tabel Data")
-    show = filtered.copy()
-    show["last_updated"] = show["last_updated"].dt.strftime("%Y-%m-%d")
-    st.dataframe(show, use_container_width=True)
-
-    st.markdown("### requirements.txt (untuk Streamlit Cloud)")
-    st.code("pandas\nplotly\nstreamlit\n", language="text")
-
-
-def render_cli():
-    df = load_data()
-    print("=== FTF Interactive Map Template (CLI fallback) ===")
-    print(f"Plotly available: {PLOTLY_AVAILABLE}")
-    print(df[["country", "iso3", "region", "update_status", "departed_mid", "has_quant"]].to_string(index=False))
-    if not PLOTLY_AVAILABLE:
-        print("\n[INFO] Install plotly untuk peta interaktif:")
-        print("pip install plotly")
-
-
-def export_html_files():
-    if not PLOTLY_AVAILABLE:
-        raise ModuleNotFoundError("plotly belum terpasang. Install dengan: pip install plotly")
-    df = load_data()
-    build_choropleth(df).write_html("ftf_map_choropleth.html", include_plotlyjs="cdn")
-    build_status_scatter(df).write_html("ftf_map_status_overlay.html", include_plotlyjs="cdn")
-    print("Saved: ftf_map_choropleth.html")
-    print("Saved: ftf_map_status_overlay.html")
-
-
-def _run_tests():
-    df = load_data()
-    assert len(df) >= 10, "Dataset sample minimal 10 negara"
-    assert "departed_mid" in df.columns and "returned_mid" in df.columns
-    # Algeria midpoint should be numeric after corrected range order
-    dza = df[df["iso3"] == "DZA"].iloc[0]
-    assert pd.notna(dza["departed_mid"]), "DZA departed_mid harus terisi"
-    # Countries with no quant should be flagged False
-    idn = df[df["iso3"] == "IDN"].iloc[0]
-    assert bool(idn["has_quant"]) is False, "Indonesia sample belum punya data kuantitatif"
-    # Plotly optional behavior
-    if PLOTLY_AVAILABLE:
-        fig = build_choropleth(df)
-        assert fig is not None
-    print("All tests passed.")
+def build_map(df, tile_style):
+    m = folium.Map(location=[15, 10], zoom_start=2, tiles=tile_style, control_scale=True, prefer_canvas=True)
+    for status in ["belum", "draft", "final"]:
+        sub = df[df["status_review"] == status]
+        fg = folium.FeatureGroup(name=f"Status: {status.title()}", show=True)
+        for _, row in sub.iterrows():
+            color = STATUS_COLORS.get(status, "#6c757d")
+            popup = folium.Popup(IFrame(html=make_popup_html(row), width=330, height=230), max_width=340)
+            tooltip_text = f"{row['country']} | {row['status_review'].upper()} | Last: {row['last_reviewed'] or '-'} | Tema: {row['tema_dominan']}"
+            folium.CircleMarker(
+                location=[row["lat"], row["lon"]], radius=8, color=color, weight=2,
+                fill=True, fill_color=color, fill_opacity=0.85,
+                tooltip=tooltip_text, popup=popup
+            ).add_to(fg)
+        fg.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    legend_html = """
+    <div style="position: fixed; bottom: 20px; left: 20px; z-index: 9999; background: white; border: 1px solid #ccc; border-radius: 8px; padding: 10px 12px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.15);">
+      <div style="font-weight:700; margin-bottom:6px;">Status Review</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#d73027;border-radius:50%;margin-right:6px;"></span>Belum</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#fdae61;border-radius:50%;margin-right:6px;"></span>Draft</div>
+      <div><span style="display:inline-block;width:10px;height:10px;background:#1a9850;border-radius:50%;margin-right:6px;"></span>Final</div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+    return m
 
 
 def main():
-    if "--test" in sys.argv:
-        _run_tests()
-        return
-    if "--export-html" in sys.argv:
-        export_html_files()
-        return
+    st.title("🗺️ Peta Interaktif FTF Knowledge Hub — Country Status Map")
+    st.caption("Prototype Latsar CPNS (Subdit Intelijen BNPT) — visualisasi status review internal berbasis matriks hasil telaah FTF Knowledge Hub (sumber terbuka).")
 
-    if STREAMLIT_AVAILABLE:
-        render_streamlit()
-    else:
-        render_cli()
+    with st.sidebar:
+        st.header("⚙️ Filter & Data")
+        uploaded = st.file_uploader("Unggah CSV matriks internal (opsional)", type=["csv"])
+        tile_style = st.selectbox("Gaya peta", ["CartoDB Positron", "OpenStreetMap", "CartoDB Voyager"], index=0)
+        st.markdown("**Struktur kolom CSV (wajib):**")
+        st.code("country, iso2, region, status_review, last_reviewed, tema_dominan, catatan_singkat, lat, lon, ftf_hub_url, brief_internal_url", language="text")
 
+    try:
+        df = load_data(uploaded)
+    except Exception as e:
+        st.error(f"Gagal memuat data: {e}")
+        st.stop()
+
+    with st.sidebar:
+        st.markdown("---")
+        regions = sorted(df["region"].dropna().unique().tolist(), key=lambda x: REGION_ORDER.index(x) if x in REGION_ORDER else 999)
+        selected_regions = st.multiselect("Filter wilayah", regions, default=regions)
+        statuses = ["belum", "draft", "final"]
+        selected_statuses = st.multiselect("Filter status review", statuses, default=statuses)
+        theme_keywords = sorted({t.strip() for items in df["tema_dominan"].fillna("").astype(str) for t in items.split(";") if t.strip()})
+        selected_theme = st.selectbox("Filter tema dominan (opsional)", ["(semua)"] + theme_keywords)
+        search_text = st.text_input("Cari negara / catatan")
+
+    filtered = df[df["region"].isin(selected_regions) & df["status_review"].isin(selected_statuses)].copy()
+    if selected_theme != "(semua)":
+        filtered = filtered[filtered["tema_dominan"].str.contains(selected_theme, case=False, na=False)]
+    if search_text:
+        patt = search_text.strip()
+        filtered = filtered[
+            filtered["country"].str.contains(patt, case=False, na=False) |
+            filtered["catatan_singkat"].str.contains(patt, case=False, na=False) |
+            filtered["tema_dominan"].str.contains(patt, case=False, na=False)
+        ]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total negara (filter)", len(filtered))
+    c2.metric("Belum", int((filtered["status_review"] == "belum").sum()) if len(filtered) else 0)
+    c3.metric("Draft", int((filtered["status_review"] == "draft").sum()) if len(filtered) else 0)
+    c4.metric("Final", int((filtered["status_review"] == "final").sum()) if len(filtered) else 0)
+
+    if filtered.empty:
+        st.warning("Tidak ada data yang cocok dengan filter.")
+        st.stop()
+
+    left, right = st.columns([2.0, 1.0], gap="large")
+    with left:
+        m = build_map(filtered, tile_style)
+        if HAS_ST_FOLIUM:
+            event = st_folium(m, width=None, height=620, returned_objects=["last_object_clicked_tooltip"])
+            if event and event.get("last_object_clicked_tooltip"):
+                st.info(f"Tooltip terakhir diklik: {event['last_object_clicked_tooltip']}")
+        else:
+            st.warning("`streamlit-folium` belum terpasang. Peta tetap tampil (render HTML). Tambahkan dependency `streamlit-folium` untuk interaksi lebih baik.")
+            st.components.v1.html(m._repr_html_(), height=640, scrolling=False)
+
+    with right:
+        st.subheader("📋 Tabel Ringkas")
+        show_cols = ["country", "region", "status_review", "last_reviewed", "tema_dominan", "catatan_singkat"]
+        st.dataframe(filtered[show_cols], use_container_width=True, hide_index=True, height=420)
+        st.subheader("📥 Template & Export")
+        st.download_button("Download data hasil filter (CSV)", data=filtered.to_csv(index=False).encode("utf-8"), file_name="ftf_country_status_filtered.csv", mime="text/csv")
+        with st.expander("Petunjuk penggunaan singkat", expanded=True):
+            st.markdown("""
+            1. **Mulai dari data contoh** atau unggah CSV matriks internal.  
+            2. Atur **filter wilayah / status / tema** di sidebar.  
+            3. **Klik marker** pada peta untuk melihat ringkasan negara dan tautan FTF Hub / brief internal.  
+            4. Gunakan tabel ringkas untuk cross-check cepat sebelum presentasi internal.
+            """)
+
+    st.markdown("---")
+    st.markdown("### Rekomendasi pengembangan lanjutan (opsional)")
+    st.markdown("- Tambahkan halaman detail negara.\n- Integrasikan scoring coverage/quality review.\n- Tambahkan riwayat pembaruan (log reviewer, tanggal revisi, perubahan status).")
 
 if __name__ == "__main__":
     main()
